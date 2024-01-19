@@ -2023,6 +2023,11 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 			goto unlock;
 		}
 		data->pwm_duty[nr] = pwm_to_reg(data, val);
+		/* it8689 needs 0x7f in the REG_PWM registers in order
+		   to heed REG_PWM_DUTY settings. */
+		if(data->type == it8689) {
+			data->write(data, IT87_REG_PWM[nr], 0x7f);
+		}
 		data->write(data, IT87_REG_PWM_DUTY[nr],
 			    data->pwm_duty[nr]);
 	} else {
