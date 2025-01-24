@@ -70,6 +70,8 @@
 #include <linux/dmi.h>
 #include <linux/acpi.h>
 #include <linux/io.h>
+#include <linux/pci.h>
+
 #include "compat.h"
 
 #ifndef IT87_DRIVER_VERSION
@@ -94,9 +96,19 @@ static struct platform_device *it87_pdev[2];
 
 /* The device with the IT8718F/IT8720F VID value in it */
 #define	GPIO	0x07
+#define	SMFI	0x0f	/* The device with SMFI registers for EC RAM mapping */
 
 #define	DEVID	0x20	/* Register: Device ID */
 #define	DEVREV	0x22	/* Register: Device Revision */
+
+/* IT87952E handling on Gigabyte AMD Zen boards */
+#define	AMD_FCH_PID	0x790e
+#define AMD_FCH_IOMEM_PORT_ENABLE_REG	0x48
+#define AMD_FCH_LPC_TARGET_START_ADDR_REG	0x60
+#define AMD_FCH_LPC_TARGET_END_ADDR_REG	0x62
+
+#define AMD_FCH_IOMEM_PORT_LPC_RANGE_FLAG	BIT(5)
+#define IT87952_FIRMWARE_OVERRIDE_REG	0x47
 
 static inline void __superio_enter(int ioreg)
 {
@@ -212,6 +224,23 @@ static inline void superio_exit(int ioreg, bool noexit)
 #define IT87_SIO_SPI_REG	0xef	/* SPI function pin select */
 #define IT87_SIO_VID_REG	0xfc	/* VID value */
 #define IT87_SIO_BEEP_PIN_REG	0xf6	/* Beep pin mapping */
+
+/* Logical device 15 (SMFI) registers (used with IT87952E only)
+ *
+ * 0xf5: Bits 15..12 -> base_addr[15..12]
+ *       Bits  7...0 -> base_addr[23..16]
+ * 0xfc: Bits  3...0 -> base_addr[27..24]
+ *
+ * On Gigabyte boards, the resulting address is ORed with 0xfc000000
+ * to obtain the base address. The relevant MMIO area is located at
+ * offset 0x900 relative to the resulting address.
+ */
+#define IT87_SIO_HLPC_BASE       0xf5 /* base address select */
+#define IT87_SIO_HLPC_BASEHIGH   0xfc /* base address select high bits */
+/* offset of writable area in mapped bank (EC RAM) */
+#define IT87952_MMIO_EC_RAM      0x900
+/* offset in EC RAM to enable firmware fan control */
+#define IT87952_MMIO_ECFW_ENABLE 0x47
 
 /* Force chip IDs to specified values. Should only be used for testing */
 static unsigned short force_id[2];
@@ -815,6 +844,13 @@ static const struct it87_devices it87_devices[] = {
 #define has_bank_sel(data)	((data)->features & FEAT_BANK_SEL)
 #define has_mmio(data)		((data)->features & FEAT_MMIO)
 
+
+struct it87_amd_lpcbridge_regs {
+	u8 map_flags;  /* 0x48 */
+	u16 startaddr; /* 0x60/1 */
+	u16 endaddr;   /* 0x62/3 */
+};
+
 struct it87_sio_data {
 	enum chips type;
 	u8 sioaddr;
@@ -832,6 +868,11 @@ struct it87_sio_data {
 	u8 skip_temp;
 	u8 smbus_bitmap;
 	u8 ec_special_config;
+	bool disable_ecfw;
+	phys_addr_t ec_ram_base;
+	u16 ec_ram_offset;
+	u8 ecfw_enable_reg;
+	struct it87_amd_lpcbridge_regs amd_regbak;
 };
 
 /*
@@ -921,6 +962,11 @@ struct it87_data {
 struct it87_dmi_data {
 	u8 skip_pwm;		/* pwm channels to skip for this board  */
 	bool skip_acpi_res;	/* ignore acpi failures on this board */
+	bool disable_ecfw; /* disable fan control by firmware */
+	phys_addr_t ec_ram_base; /* base address for EC RAM access */
+ /* page inside mapped area at base address containing the EC RAM page */
+  u16 ec_ram_offset;
+	u8 ecfw_enable_reg; /* EC RAM location containing FW enable flag */
 };
 
 /* Global for results from DMI matching, if needed */
@@ -1153,6 +1199,19 @@ static int it87_mmio_read(struct it87_data *data, u16 reg)
 static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 {
 	writeb(value, data->mmio + reg);
+}
+
+static phys_addr_t it87_get_smfi_base(struct it87_data *data)
+{
+	u16 base;
+	u8 basehi;
+	phys_addr_t result;
+	superio_select(data->sioaddr, SMFI);
+	base = superio_inw(data->sioaddr, IT87_SIO_HLPC_BASE);
+	basehi = superio_inb(data->sioaddr, IT87_SIO_HLPC_BASEHIGH);
+	result = (basehi << 24) | (base & 0xf000) | ((base & 0xff) << 16);
+	pr_info("EC_RAM_BASE = %08llx\n", result);
+	return result;
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -3788,8 +3847,13 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 		pr_info("Beeping is supported\n");
 
 	/* Set values based on DMI matches */
-	if (dmi_data)
+	if (dmi_data) {
 		sio_data->skip_pwm |= dmi_data->skip_pwm;
+		sio_data->disable_ecfw |= dmi_data->disable_ecfw;
+		sio_data->ec_ram_base = dmi_data->ec_ram_base;
+		sio_data->ec_ram_offset = dmi_data->ec_ram_offset;
+		sio_data->ecfw_enable_reg = dmi_data->ecfw_enable_reg;
+	}
 
 	if (config->smbus_bitmap && !base) {
 		u8 reg;
@@ -3949,6 +4013,80 @@ static void it87_check_tachometers_16bit_mode(struct platform_device *pdev)
 	}
 }
 
+static void it87_amd_lpcbridge_save_regs(struct platform_device *pdev,
+				   struct pci_dev *lpcbridge) {
+	struct it87_sio_data *sio_data = dev_get_platdata(&pdev->dev);
+	pci_read_config_byte(lpcbridge, AMD_FCH_IOMEM_PORT_ENABLE_REG,
+					   &sio_data->amd_regbak.map_flags);
+	pci_read_config_word(lpcbridge, AMD_FCH_LPC_TARGET_START_ADDR_REG,
+					   &sio_data->amd_regbak.startaddr);
+	pci_read_config_word(lpcbridge, AMD_FCH_LPC_TARGET_END_ADDR_REG,
+					   &sio_data->amd_regbak.endaddr);
+}
+
+static void it87_amd_lpcbridge_restore_regs(struct platform_device *pdev,
+				   struct pci_dev *lpcbridge) {
+	struct it87_sio_data *sio_data = dev_get_platdata(&pdev->dev);
+	pci_write_config_byte(lpcbridge, AMD_FCH_IOMEM_PORT_ENABLE_REG,
+					   sio_data->amd_regbak.map_flags);
+	pci_write_config_word(lpcbridge, AMD_FCH_LPC_TARGET_START_ADDR_REG,
+					   sio_data->amd_regbak.startaddr);
+	pci_write_config_word(lpcbridge, AMD_FCH_LPC_TARGET_END_ADDR_REG,
+					   sio_data->amd_regbak.endaddr);
+}
+
+static void it87_amd_lpcbridge_map_ecram(struct pci_dev *lpcbridge,
+				   phys_addr_t addr) {
+	  u8 flags;
+
+		u16 start_addr = (addr >> 16) & 0xfff0;
+		u16 end_addr = (addr >> 16) + 1;
+
+		pci_read_config_byte(lpcbridge, AMD_FCH_IOMEM_PORT_ENABLE_REG, &flags);
+		flags |= AMD_FCH_IOMEM_PORT_LPC_RANGE_FLAG;
+		pci_write_config_byte(lpcbridge, AMD_FCH_IOMEM_PORT_ENABLE_REG, flags);
+		pci_write_config_word(lpcbridge, AMD_FCH_LPC_TARGET_START_ADDR_REG, start_addr);
+		pci_write_config_word(lpcbridge, AMD_FCH_LPC_TARGET_END_ADDR_REG, end_addr);
+}
+
+/* Check if the present chip needs EC firmware disabled for fan control */
+static void it87_check_ecfw_disable(struct platform_device *pdev) {
+	struct it87_sio_data *sio_data = dev_get_platdata(&pdev->dev);
+	struct it87_data *data = platform_get_drvdata(pdev);
+	struct pci_dev *lpcbridge;
+
+	phys_addr_t ec_smfi_mmio_addr;
+	u8 *addr;
+
+	if(!sio_data->disable_ecfw)
+		return;
+
+  /* so far this method is only known for IT87952E, bail otherwise */
+	if(sio_data->type != it87952)
+		return;
+
+	ec_smfi_mmio_addr = it87_get_smfi_base(data);
+	ec_smfi_mmio_addr |= sio_data->ec_ram_base;
+	ec_smfi_mmio_addr |= sio_data->ec_ram_offset;
+
+	lpcbridge = pci_get_device(PCI_VENDOR_ID_AMD, AMD_FCH_PID, NULL);
+	if(lpcbridge) {
+		/* map LPC target address space via PCI-LPC bridge */
+		it87_amd_lpcbridge_save_regs(pdev, lpcbridge);
+		it87_amd_lpcbridge_map_ecram(lpcbridge, ec_smfi_mmio_addr);
+
+		/* clear firmware fan control enable flag */
+		addr = ioremap(ec_smfi_mmio_addr, 0x100);
+		addr[sio_data->ecfw_enable_reg] = 0;
+		iounmap(addr);
+
+		/* restore previous configuration of PCI-LPC bridge */
+		it87_amd_lpcbridge_restore_regs(pdev, lpcbridge);
+	} else {
+		/* TODO Intel LPC bridge for potential Intel based boards */
+	}
+}
+
 static void it87_start_monitoring(struct it87_data *data)
 {
 	data->write(data, IT87_REG_CONFIG,
@@ -3992,6 +4130,7 @@ static void it87_init_device(struct platform_device *pdev)
 
 	it87_check_limit_regs(data);
 
+	it87_check_ecfw_disable(pdev);
 	/*
 	 * Temperature channels are not forcibly enabled, as they can be
 	 * set to two different sensor types and we can't guess which one
@@ -4350,6 +4489,7 @@ static int it87_resume(struct device *dev)
 	it87_check_pwm(dev);
 	it87_check_limit_regs(data);
 	it87_check_voltage_monitors_reset(data);
+	it87_check_ecfw_disable(pdev);
 	it87_check_tachometers_reset(pdev);
 	it87_check_tachometers_16bit_mode(pdev);
 
@@ -4469,8 +4609,32 @@ static struct it87_dmi_data nvidia_fn68pt = {
  * but set programatically.
  */
 static struct it87_dmi_data it87_acpi_ignore = {
-	.skip_acpi_res = true,
+	.skip_acpi_res = true
 };
+
+/*
+	* IT87952 on Gigabyte boards runs a custom firmware that is controlled via
+	* LPC mapped EC RAM. In order to allow control via Super-IO a flag in EC RAM
+	* must be cleared to disable automatic firmware operation. Otherwise the chip
+	* will accept SIO writes but they will immediately be overwritten by the EC
+	* firmware.
+	* Implies skip_acpi_res since the same boards are affected.
+	*/
+static struct it87_dmi_data it87_ecfw_disable_x570s_aorus_master = {
+	.disable_ecfw = true,
+	.skip_acpi_res = true,
+	.ec_ram_base = 0xfc000000,
+	.ec_ram_offset = 0x900,
+	.ecfw_enable_reg = 0x47
+};
+
+#define IT87_GBT_ECFW_MAP(rambase, enablereg) \
+	static struct it87_ecfw_disable_{ \
+		.disable_ecfw = true, \
+		.skip_acpi_res = true, \
+		.ec_ram_base = rambase, \
+		.ecfw_enable_reg = enablereg \
+	}
 
 #define IT87_DMI_MATCH_VND(vendor, name, cb, data) \
 	{ \
@@ -4566,6 +4730,9 @@ static const struct dmi_system_id it87_dmi_table[] __initconst = {
 		/* IT8689E + IT87952E */
 	IT87_DMI_MATCH_GBT("Z790 AORUS MASTER", it87_dmi_cb,
 			   &it87_acpi_ignore),
+		/* IT8689E + IT87952E */
+	IT87_DMI_MATCH_GBT("X570S AORUS MASTER", it87_sio_force,
+			   &it87_ecfw_disable_x570s_aorus_master),
 		/* IT8689E + IT87952E */
 	IT87_DMI_MATCH_VND("nVIDIA", "FN68PT", it87_dmi_cb, &nvidia_fn68pt),
 	{ }
